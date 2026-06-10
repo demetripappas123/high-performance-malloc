@@ -302,6 +302,18 @@ static void rb_delete_fixup(block_header **root, block_header *x) {
 }
 
 static void rb_delete(block_header **root, block_header *z) {
+    if (z == NULL || is_nil(z))
+        return;
+
+    // deleting the only node in the tree
+    if (z->parent == NULL && is_nil(z->left) && is_nil(z->right)) {
+        *root = NULL;
+        z->left = z->right = nil();
+        z->parent = NULL;
+        z->color = BLACK;
+        return;
+    }
+
     block_header *y = z;
     block_header *x;
     node_color y_orig_color = y->color;
@@ -395,6 +407,53 @@ static void free_to_pool(block_header *b) {
         tree_insert_block(b);
 }
 
+static void remove_from_pool(block_header *b) {
+    if (b->size <= SIZE_THRESHOLD)
+        bucket_remove(b, bucket_index_for_size(b->size));
+    else
+        tree_remove_block(b);
+}
+
+
+
+static block_header *coalesce(block_header *b) {
+    // merge with previous neighbor
+    if (b->prev_heap && b->prev_heap->free) {
+        block_header *p = b->prev_heap;
+
+        remove_from_pool(p);
+
+        p->size += sizeof(block_header) + b->size;
+        p->next_heap = b->next_heap;
+
+        if (b->next_heap)
+            b->next_heap->prev_heap = p;
+        else
+            heap_tail = p;
+
+        b = p;
+    }
+
+    // merge with next neighbor
+    if (b->next_heap && b->next_heap->free) {
+        block_header *n = b->next_heap;
+
+        remove_from_pool(n);
+
+        b->size += sizeof(block_header) + n->size;
+        b->next_heap = n->next_heap;
+
+        if (n->next_heap)
+            n->next_heap->prev_heap = b;
+        else
+            heap_tail = b;
+    }
+
+    return b;
+}
+
+
+
 /*
  * If b is larger than need, split so user gets exactly need; remainder returned to pool.
  */
@@ -472,14 +531,25 @@ void *hpmalloc(size_t size) {
     return (void *)(blk + 1);
 }
 
+
 void hpfree(void *ptr) {
     if (!ptr)
         return;
+
     hp_init();
 
     block_header *b = (block_header *)ptr - 1;
+
     if (b->magic != MAGIC)
         return;
+
+    // prevent double free corruption
+    if (b->free)
+        return;
+
+    b->free = 1;
+
+    b = coalesce(b);
 
     free_to_pool(b);
 }
