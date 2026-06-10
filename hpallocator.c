@@ -64,6 +64,20 @@ static block_header *heap_head = NULL;
 static block_header *heap_tail = NULL;
 static int hp_initialized;
 
+//for testing metrics 
+static size_t split_count = 0;
+static size_t coalesce_count = 0;
+static size_t sbrk_calls = 0;
+static size_t bytes_requested_from_os = 0;
+static size_t malloc_calls = 0;
+static size_t free_calls = 0;
+
+
+
+
+
+
+
 static void hp_init(void) {
     if (hp_initialized)
         return;
