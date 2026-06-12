@@ -389,6 +389,11 @@ static block_header *request_space(block_header *last, size_t user_size) {
     if (block == (void *)-1)
         return NULL;
 
+
+    sbrk_calls++;
+    bytes_requested_from_os += sizeof(block_header) + user_size;
+
+    
     block->size = user_size;
     block->magic = MAGIC;
     block->free = 0;
@@ -433,6 +438,7 @@ static void remove_from_pool(block_header *b) {
 static block_header *coalesce(block_header *b) {
     // merge with previous neighbor
     if (b->prev_heap && b->prev_heap->free) {
+        coalesce_count++;
         block_header *p = b->prev_heap;
 
         remove_from_pool(p);
@@ -450,6 +456,7 @@ static block_header *coalesce(block_header *b) {
 
     // merge with next neighbor
     if (b->next_heap && b->next_heap->free) {
+        coalesce_count++;
         block_header *n = b->next_heap;
 
         remove_from_pool(n);
@@ -477,7 +484,9 @@ static block_header *split_block(block_header *b, size_t need) {
     if (b->size < total_after_split)
         return b;
 
+    split_count++;
     size_t rem_payload = b->size - need - header_sz;
+
     block_header *n = (block_header *)((unsigned char *)(b + 1) + need);
     n->size = rem_payload;
     n->magic = MAGIC;
@@ -500,6 +509,9 @@ static block_header *split_block(block_header *b, size_t need) {
 }
 
 void *hpmalloc(size_t size) {
+
+    malloc_calls++;
+
     hp_init();
 
     if (size == 0)
@@ -549,6 +561,8 @@ void *hpmalloc(size_t size) {
 void hpfree(void *ptr) {
     if (!ptr)
         return;
+
+    free_calls++;
 
     hp_init();
 
