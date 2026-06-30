@@ -341,10 +341,9 @@ static void rb_delete(block_header **root, block_header *z) {
         y = subtree_min(z->right);
         y_orig_color = y->color;
         x = y->right;
-        if (y->parent == z) {
-            if (!is_nil(x))
-                x->parent = y;
-        } else {
+        if (y->parent == z)
+            x->parent = y;
+        else {
             rb_transplant(root, y, y->right);
             y->right = z->right;
             y->right->parent = y;
@@ -356,6 +355,10 @@ static void rb_delete(block_header **root, block_header *z) {
     }
     if (y_orig_color == BLACK)
         rb_delete_fixup(root, x);
+
+    z->left = z->right = nil();
+    z->parent = NULL;
+    z->color = BLACK;
 }
 
 /* Smallest free block in tree with size >= need, or NULL. */
@@ -363,7 +366,7 @@ static block_header *rb_best_fit(block_header *root, size_t need) {
     block_header *best = NULL;
     block_header *x = root;
     while (x != NULL && !is_nil(x)) {
-        if (x->size >= need) {
+        if (x->free && x->size >= need) {
             best = x;
             x = x->left;
         } else {
@@ -554,6 +557,9 @@ void *hpmalloc(size_t size) {
     blk = split_block(blk, need);
     blk->free = 0;
     blk->prev = blk->next = NULL;
+    blk->left = blk->right = nil();
+    blk->parent = NULL;
+    blk->color = BLACK;
     return (void *)(blk + 1);
 }
 
