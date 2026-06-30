@@ -22,22 +22,81 @@ _Static_assert(SIZE_THRESHOLD == (1ul << HPA_LOG2_THRESHOLD),
 
 typedef enum { RED, BLACK } node_color;
 
+#define HP_SIZE_MASK ((size_t)~7u)
+#define HP_FREE_BIT  ((size_t)1)
+#define HP_RED_BIT   ((size_t)2)
+
 typedef struct block_header {
-    size_t size;
-    int magic;
-    int free;
-    /* Doubly linked heap list (all blocks in address order). */
+    size_t size_and_flags;
+#ifndef NDEBUG
+    uint32_t magic;
+#endif
     struct block_header *prev_heap;
     struct block_header *next_heap;
-    /* Segregated free-list links (when free and size <= THRESHOLD). */
-    struct block_header *prev;
-    struct block_header *next;
-    /* Red–black tree (when free and size > THRESHOLD, or links unused). */
-    node_color color;
-    struct block_header *left;
-    struct block_header *right;
-    struct block_header *parent;
+    union {
+        struct {
+            struct block_header *prev;
+            struct block_header *next;
+        } bucket;
+        struct {
+            struct block_header *left;
+            struct block_header *right;
+            struct block_header *parent;
+        } tree;
+    } pool;
 } block_header;
+
+#define BUCKET_PREV(b) ((b)->pool.bucket.prev)
+#define BUCKET_NEXT(b) ((b)->pool.bucket.next)
+#define TREE_LEFT(b)   ((b)->pool.tree.left)
+#define TREE_RIGHT(b)  ((b)->pool.tree.right)
+#define TREE_PARENT(b) ((b)->pool.tree.parent)
+
+static inline size_t block_size(const block_header *b) {
+    return b->size_and_flags & HP_SIZE_MASK;
+}
+
+static inline int block_is_free(const block_header *b) {
+    return (int)(b->size_and_flags & HP_FREE_BIT);
+}
+
+static inline node_color block_color(const block_header *b) {
+    return (b->size_and_flags & HP_RED_BIT) ? RED : BLACK;
+}
+
+static inline void block_set_size(block_header *b, size_t payload) {
+    b->size_and_flags = (b->size_and_flags & ~HP_SIZE_MASK) | (payload & HP_SIZE_MASK);
+}
+
+static inline void block_set_free(block_header *b, int free) {
+    if (free)
+        b->size_and_flags |= HP_FREE_BIT;
+    else
+        b->size_and_flags &= ~HP_FREE_BIT;
+}
+
+static inline void block_set_color(block_header *b, node_color c) {
+    if (c == RED)
+        b->size_and_flags |= HP_RED_BIT;
+    else
+        b->size_and_flags &= ~HP_RED_BIT;
+}
+
+static inline void block_init_header(block_header *b, size_t payload, int free) {
+    b->size_and_flags = (payload & HP_SIZE_MASK) | (free ? HP_FREE_BIT : 0);
+#ifndef NDEBUG
+    b->magic = MAGIC;
+#endif
+}
+
+static inline int block_magic_ok(const block_header *b) {
+#ifndef NDEBUG
+    return b->magic == MAGIC;
+#else
+    (void)b;
+    return 1;
+#endif
+}
 
 /* ---------- NIL sentinel (all “null” RB children point here) ---------- */
 
@@ -47,15 +106,22 @@ static block_header *nil(void) {
     return &rb_nil_storage;
 }
 
+static inline void block_clear_pool_links(block_header *b) {
+    BUCKET_PREV(b) = BUCKET_NEXT(b) = NULL;
+    TREE_LEFT(b) = TREE_RIGHT(b) = nil();
+    TREE_PARENT(b) = NULL;
+    block_set_color(b, BLACK);
+}
+
 static int is_nil(const block_header *x) {
     return x == &rb_nil_storage;
 }
 
 static void rb_nil_init(void) {
-    rb_nil_storage.left = rb_nil_storage.right = nil();
-    rb_nil_storage.parent = NULL;
-    rb_nil_storage.color = BLACK;
-    rb_nil_storage.size = 0;
+    block_init_header(&rb_nil_storage, 0, 0);
+    TREE_LEFT(&rb_nil_storage) = TREE_RIGHT(&rb_nil_storage) = nil();
+    TREE_PARENT(&rb_nil_storage) = NULL;
+    block_set_color(&rb_nil_storage, BLACK);
 }
 
 static block_header *rb_root = NULL;
@@ -107,56 +173,56 @@ static unsigned bucket_index_for_size(size_t s) {
 }
 
 static void bucket_insert(block_header *b) {
-    unsigned i = bucket_index_for_size(b->size);
-    b->prev = NULL;
-    b->next = buckets[i];
+    unsigned i = bucket_index_for_size(block_size(b));
+    BUCKET_PREV(b) = NULL;
+    BUCKET_NEXT(b) = buckets[i];
     if (buckets[i])
-        buckets[i]->prev = b;
+        BUCKET_PREV(buckets[i]) = b;
     buckets[i] = b;
 }
 
 static void bucket_remove(block_header *b, unsigned idx) {
-    if (b->prev)
-        b->prev->next = b->next;
+    if (BUCKET_PREV(b))
+        BUCKET_NEXT(BUCKET_PREV(b)) = BUCKET_NEXT(b);
     else
-        buckets[idx] = b->next;
-    if (b->next)
-        b->next->prev = b->prev;
-    b->prev = b->next = NULL;
+        buckets[idx] = BUCKET_NEXT(b);
+    if (BUCKET_NEXT(b))
+        BUCKET_PREV(BUCKET_NEXT(b)) = BUCKET_PREV(b);
+    BUCKET_PREV(b) = BUCKET_NEXT(b) = NULL;
 }
 
 /* ---------- Red–black tree (intrusive on block_header, key = size) ---------- */
 
 static void left_rotate(block_header **root, block_header *x) {
-    block_header *y = x->right;
-    x->right = y->left;
-    if (!is_nil(y->left))
-        y->left->parent = x;
-    y->parent = x->parent;
-    if (x->parent == NULL)
+    block_header *y = TREE_RIGHT(x);
+    TREE_RIGHT(x) = TREE_LEFT(y);
+    if (!is_nil(TREE_LEFT(y)))
+        TREE_PARENT(TREE_LEFT(y)) = x;
+    TREE_PARENT(y) = TREE_PARENT(x);
+    if (TREE_PARENT(x) == NULL)
         *root = y;
-    else if (x == x->parent->left)
-        x->parent->left = y;
+    else if (x == TREE_LEFT(TREE_PARENT(x)))
+        TREE_LEFT(TREE_PARENT(x)) = y;
     else
-        x->parent->right = y;
-    y->left = x;
-    x->parent = y;
+        TREE_RIGHT(TREE_PARENT(x)) = y;
+    TREE_LEFT(y) = x;
+    TREE_PARENT(x) = y;
 }
 
 static void right_rotate(block_header **root, block_header *x) {
-    block_header *y = x->left;
-    x->left = y->right;
-    if (!is_nil(y->right))
-        y->right->parent = x;
-    y->parent = x->parent;
-    if (x->parent == NULL)
+    block_header *y = TREE_LEFT(x);
+    TREE_LEFT(x) = TREE_RIGHT(y);
+    if (!is_nil(TREE_RIGHT(y)))
+        TREE_PARENT(TREE_RIGHT(y)) = x;
+    TREE_PARENT(y) = TREE_PARENT(x);
+    if (TREE_PARENT(x) == NULL)
         *root = y;
-    else if (x == x->parent->left)
-        x->parent->left = y;
+    else if (x == TREE_LEFT(TREE_PARENT(x)))
+        TREE_LEFT(TREE_PARENT(x)) = y;
     else
-        x->parent->right = y;
-    y->right = x;
-    x->parent = y;
+        TREE_RIGHT(TREE_PARENT(x)) = y;
+    TREE_RIGHT(y) = x;
+    TREE_PARENT(x) = y;
 }
 
 static void rb_bst_insert(block_header **root, block_header *z) {
@@ -164,68 +230,68 @@ static void rb_bst_insert(block_header **root, block_header *z) {
     block_header *x = *root;
     while (!is_nil(x) && x != NULL) {
         y = x;
-        if (z->size < x->size)
-            x = x->left;
+        if (block_size(z) < block_size(x))
+            x = TREE_LEFT(x);
         else
-            x = x->right;
+            x = TREE_RIGHT(x);
     }
-    z->parent = y;
+    TREE_PARENT(z) = y;
     if (y == NULL) {
         *root = z;
-    } else if (z->size < y->size) {
-        y->left = z;
+    } else if (block_size(z) < block_size(y)) {
+        TREE_LEFT(y) = z;
     } else {
-        y->right = z;
+        TREE_RIGHT(y) = z;
     }
-    z->left = z->right = nil();
-    z->color = RED;
+    TREE_LEFT(z) = TREE_RIGHT(z) = nil();
+    block_set_color(z, RED);
 }
 
 static void rb_insert_fixup(block_header **root, block_header *z) {
-    while (z->parent != NULL && z->parent->color == RED) {
-        if (z->parent == z->parent->parent->left) {
-            block_header *y = z->parent->parent->right;
-            if (y != NULL && !is_nil(y) && y->color == RED) {
-                z->parent->color = BLACK;
-                y->color = BLACK;
-                z->parent->parent->color = RED;
-                z = z->parent->parent;
+    while (TREE_PARENT(z) != NULL && block_color(TREE_PARENT(z)) == RED) {
+        if (TREE_PARENT(z) == TREE_LEFT(TREE_PARENT(TREE_PARENT(z)))) {
+            block_header *y = TREE_RIGHT(TREE_PARENT(TREE_PARENT(z)));
+            if (y != NULL && !is_nil(y) && block_color(y) == RED) {
+                block_set_color(TREE_PARENT(z), BLACK);
+                block_set_color(y, BLACK);
+                block_set_color(TREE_PARENT(TREE_PARENT(z)), RED);
+                z = TREE_PARENT(TREE_PARENT(z));
             } else {
-                if (z == z->parent->right) {
-                    z = z->parent;
+                if (z == TREE_RIGHT(TREE_PARENT(z))) {
+                    z = TREE_PARENT(z);
                     left_rotate(root, z);
                 }
-                z->parent->color = BLACK;
-                z->parent->parent->color = RED;
-                right_rotate(root, z->parent->parent);
+                block_set_color(TREE_PARENT(z), BLACK);
+                block_set_color(TREE_PARENT(TREE_PARENT(z)), RED);
+                right_rotate(root, TREE_PARENT(TREE_PARENT(z)));
             }
         } else {
-            block_header *y = z->parent->parent->left;
-            if (y != NULL && !is_nil(y) && y->color == RED) {
-                z->parent->color = BLACK;
-                y->color = BLACK;
-                z->parent->parent->color = RED;
-                z = z->parent->parent;
+            block_header *y = TREE_LEFT(TREE_PARENT(TREE_PARENT(z)));
+            if (y != NULL && !is_nil(y) && block_color(y) == RED) {
+                block_set_color(TREE_PARENT(z), BLACK);
+                block_set_color(y, BLACK);
+                block_set_color(TREE_PARENT(TREE_PARENT(z)), RED);
+                z = TREE_PARENT(TREE_PARENT(z));
             } else {
-                if (z == z->parent->left) {
-                    z = z->parent;
+                if (z == TREE_LEFT(TREE_PARENT(z))) {
+                    z = TREE_PARENT(z);
                     right_rotate(root, z);
                 }
-                z->parent->color = BLACK;
-                z->parent->parent->color = RED;
-                left_rotate(root, z->parent->parent);
+                block_set_color(TREE_PARENT(z), BLACK);
+                block_set_color(TREE_PARENT(TREE_PARENT(z)), RED);
+                left_rotate(root, TREE_PARENT(TREE_PARENT(z)));
             }
         }
     }
     if (*root != NULL)
-        (*root)->color = BLACK;
+        block_set_color(*root, BLACK);
 }
 
 static void rb_insert(block_header **root, block_header *z) {
     if (*root == NULL) {
-        z->parent = NULL;
-        z->left = z->right = nil();
-        z->color = BLACK;
+        TREE_PARENT(z) = NULL;
+        TREE_LEFT(z) = TREE_RIGHT(z) = nil();
+        block_set_color(z, BLACK);
         *root = z;
         return;
     }
@@ -234,134 +300,133 @@ static void rb_insert(block_header **root, block_header *z) {
 }
 
 static block_header *subtree_min(block_header *x) {
-    while (!is_nil(x->left))
-        x = x->left;
+    while (!is_nil(TREE_LEFT(x)))
+        x = TREE_LEFT(x);
     return x;
 }
 
 static void rb_transplant(block_header **root, block_header *u, block_header *v) {
-    if (u->parent == NULL) {
+    if (TREE_PARENT(u) == NULL) {
         if (is_nil(v))
             *root = NULL;
         else
             *root = v;
-    } else if (u == u->parent->left) {
-        u->parent->left = v;
+    } else if (u == TREE_LEFT(TREE_PARENT(u))) {
+        TREE_LEFT(TREE_PARENT(u)) = v;
     } else {
-        u->parent->right = v;
+        TREE_RIGHT(TREE_PARENT(u)) = v;
     }
     if (is_nil(v))
-        nil()->parent = u->parent;
+        TREE_PARENT(nil()) = TREE_PARENT(u);
     else
-        v->parent = u->parent;
+        TREE_PARENT(v) = TREE_PARENT(u);
 }
 
-#define IS_BLACK(n) (is_nil(n) || (n)->color == BLACK)
+#define IS_BLACK(n) (is_nil(n) || block_color(n) == BLACK)
 
 static void rb_delete_fixup(block_header **root, block_header *x) {
     while (x != *root && IS_BLACK(x)) {
-        if (x == x->parent->left) {
-            block_header *w = x->parent->right;
+        if (x == TREE_LEFT(TREE_PARENT(x))) {
+            block_header *w = TREE_RIGHT(TREE_PARENT(x));
             if (!IS_BLACK(w)) {
-                w->color = BLACK;
-                x->parent->color = RED;
-                left_rotate(root, x->parent);
-                w = x->parent->right;
+                block_set_color(w, BLACK);
+                block_set_color(TREE_PARENT(x), RED);
+                left_rotate(root, TREE_PARENT(x));
+                w = TREE_RIGHT(TREE_PARENT(x));
             }
-            if (IS_BLACK(w->left) && IS_BLACK(w->right)) {
-                w->color = RED;
-                x = x->parent;
+            if (IS_BLACK(TREE_LEFT(w)) && IS_BLACK(TREE_RIGHT(w))) {
+                block_set_color(w, RED);
+                x = TREE_PARENT(x);
             } else {
-                if (IS_BLACK(w->right)) {
-                    if (!is_nil(w->left))
-                        w->left->color = BLACK;
-                    w->color = RED;
+                if (IS_BLACK(TREE_RIGHT(w))) {
+                    if (!is_nil(TREE_LEFT(w)))
+                        block_set_color(TREE_LEFT(w), BLACK);
+                    block_set_color(w, RED);
                     right_rotate(root, w);
-                    w = x->parent->right;
+                    w = TREE_RIGHT(TREE_PARENT(x));
                 }
-                w->color = x->parent->color;
-                x->parent->color = BLACK;
-                if (!is_nil(w->right))
-                    w->right->color = BLACK;
-                left_rotate(root, x->parent);
+                block_set_color(w, block_color(TREE_PARENT(x)));
+                block_set_color(TREE_PARENT(x), BLACK);
+                if (!is_nil(TREE_RIGHT(w)))
+                    block_set_color(TREE_RIGHT(w), BLACK);
+                left_rotate(root, TREE_PARENT(x));
                 x = *root;
             }
         } else {
-            block_header *w = x->parent->left;
+            block_header *w = TREE_LEFT(TREE_PARENT(x));
             if (!IS_BLACK(w)) {
-                w->color = BLACK;
-                x->parent->color = RED;
-                right_rotate(root, x->parent);
-                w = x->parent->left;
+                block_set_color(w, BLACK);
+                block_set_color(TREE_PARENT(x), RED);
+                right_rotate(root, TREE_PARENT(x));
+                w = TREE_LEFT(TREE_PARENT(x));
             }
-            if (IS_BLACK(w->left) && IS_BLACK(w->right)) {
-                w->color = RED;
-                x = x->parent;
+            if (IS_BLACK(TREE_LEFT(w)) && IS_BLACK(TREE_RIGHT(w))) {
+                block_set_color(w, RED);
+                x = TREE_PARENT(x);
             } else {
-                if (IS_BLACK(w->left)) {
-                    if (!is_nil(w->right))
-                        w->right->color = BLACK;
-                    w->color = RED;
+                if (IS_BLACK(TREE_LEFT(w))) {
+                    if (!is_nil(TREE_RIGHT(w)))
+                        block_set_color(TREE_RIGHT(w), BLACK);
+                    block_set_color(w, RED);
                     left_rotate(root, w);
-                    w = x->parent->left;
+                    w = TREE_LEFT(TREE_PARENT(x));
                 }
-                w->color = x->parent->color;
-                x->parent->color = BLACK;
-                if (!is_nil(w->left))
-                    w->left->color = BLACK;
-                right_rotate(root, x->parent);
+                block_set_color(w, block_color(TREE_PARENT(x)));
+                block_set_color(TREE_PARENT(x), BLACK);
+                if (!is_nil(TREE_LEFT(w)))
+                    block_set_color(TREE_LEFT(w), BLACK);
+                right_rotate(root, TREE_PARENT(x));
                 x = *root;
             }
         }
     }
     if (!is_nil(x) && x != NULL)
-        x->color = BLACK;
+        block_set_color(x, BLACK);
 }
 
 static void rb_delete(block_header **root, block_header *z) {
     if (z == NULL || is_nil(z))
         return;
 
-    // deleting the only node in the tree
-    if (z->parent == NULL && is_nil(z->left) && is_nil(z->right)) {
+    if (TREE_PARENT(z) == NULL && is_nil(TREE_LEFT(z)) && is_nil(TREE_RIGHT(z))) {
         *root = NULL;
-        z->left = z->right = nil();
-        z->parent = NULL;
-        z->color = BLACK;
+        TREE_LEFT(z) = TREE_RIGHT(z) = nil();
+        TREE_PARENT(z) = NULL;
+        block_set_color(z, BLACK);
         return;
     }
 
     block_header *y = z;
     block_header *x;
-    node_color y_orig_color = y->color;
-    if (is_nil(z->left)) {
-        x = z->right;
-        rb_transplant(root, z, z->right);
-    } else if (is_nil(z->right)) {
-        x = z->left;
-        rb_transplant(root, z, z->left);
+    node_color y_orig_color = block_color(y);
+    if (is_nil(TREE_LEFT(z))) {
+        x = TREE_RIGHT(z);
+        rb_transplant(root, z, TREE_RIGHT(z));
+    } else if (is_nil(TREE_RIGHT(z))) {
+        x = TREE_LEFT(z);
+        rb_transplant(root, z, TREE_LEFT(z));
     } else {
-        y = subtree_min(z->right);
-        y_orig_color = y->color;
-        x = y->right;
-        if (y->parent == z)
-            x->parent = y;
+        y = subtree_min(TREE_RIGHT(z));
+        y_orig_color = block_color(y);
+        x = TREE_RIGHT(y);
+        if (TREE_PARENT(y) == z)
+            TREE_PARENT(x) = y;
         else {
-            rb_transplant(root, y, y->right);
-            y->right = z->right;
-            y->right->parent = y;
+            rb_transplant(root, y, TREE_RIGHT(y));
+            TREE_RIGHT(y) = TREE_RIGHT(z);
+            TREE_PARENT(TREE_RIGHT(y)) = y;
         }
         rb_transplant(root, z, y);
-        y->left = z->left;
-        y->left->parent = y;
-        y->color = z->color;
+        TREE_LEFT(y) = TREE_LEFT(z);
+        TREE_PARENT(TREE_LEFT(y)) = y;
+        block_set_color(y, block_color(z));
     }
     if (y_orig_color == BLACK)
         rb_delete_fixup(root, x);
 
-    z->left = z->right = nil();
-    z->parent = NULL;
-    z->color = BLACK;
+    TREE_LEFT(z) = TREE_RIGHT(z) = nil();
+    TREE_PARENT(z) = NULL;
+    block_set_color(z, BLACK);
 }
 
 /* Smallest free block in tree with size >= need, or NULL. */
@@ -369,11 +434,11 @@ static block_header *rb_best_fit(block_header *root, size_t need) {
     block_header *best = NULL;
     block_header *x = root;
     while (x != NULL && !is_nil(x)) {
-        if (x->free && x->size >= need) {
+        if (block_is_free(x) && block_size(x) >= need) {
             best = x;
-            x = x->left;
+            x = TREE_LEFT(x);
         } else {
-            x = x->right;
+            x = TREE_RIGHT(x);
         }
     }
     return best;
@@ -384,7 +449,7 @@ static void tree_remove_block(block_header *b) {
 }
 
 static void tree_insert_block(block_header *b) {
-    b->prev = b->next = NULL;
+    block_clear_pool_links(b);
     rb_insert(&rb_root, b);
 }
 
@@ -402,15 +467,10 @@ static block_header *request_space(block_header *last, size_t user_size) {
         peak_bytes_from_os = bytes_requested_from_os;
 
     
-    block->size = user_size;
-    block->magic = MAGIC;
-    block->free = 0;
-    block->prev = block->next = NULL;
+    block_init_header(block, user_size, 0);
+    block_clear_pool_links(block);
     block->prev_heap = last;
     block->next_heap = NULL;
-    block->left = block->right = nil();
-    block->parent = NULL;
-    block->color = BLACK;
 
     if (last) {
         last->next_heap = block;
@@ -422,21 +482,18 @@ static block_header *request_space(block_header *last, size_t user_size) {
 }
 
 static void free_to_pool(block_header *b) {
-    b->free = 1;
-    b->prev = b->next = NULL;
-    b->left = b->right = nil();
-    b->parent = NULL;
-    b->color = BLACK;
+    block_set_free(b, 1);
+    block_clear_pool_links(b);
 
-    if (b->size <= SIZE_THRESHOLD)
+    if (block_size(b) <= SIZE_THRESHOLD)
         bucket_insert(b);
     else
         tree_insert_block(b);
 }
 
 static void remove_from_pool(block_header *b) {
-    if (b->size <= SIZE_THRESHOLD)
-        bucket_remove(b, bucket_index_for_size(b->size));
+    if (block_size(b) <= SIZE_THRESHOLD)
+        bucket_remove(b, bucket_index_for_size(block_size(b)));
     else
         tree_remove_block(b);
 }
@@ -445,13 +502,13 @@ static void remove_from_pool(block_header *b) {
 
 static block_header *coalesce(block_header *b) {
     // merge with previous neighbor
-    if (b->prev_heap && b->prev_heap->free) {
+    if (b->prev_heap && block_is_free(b->prev_heap)) {
         coalesce_count++;
         block_header *p = b->prev_heap;
 
         remove_from_pool(p);
 
-        p->size += sizeof(block_header) + b->size;
+        block_set_size(p, block_size(p) + sizeof(block_header) + block_size(b));
         p->next_heap = b->next_heap;
 
         if (b->next_heap)
@@ -463,13 +520,13 @@ static block_header *coalesce(block_header *b) {
     }
 
     // merge with next neighbor
-    if (b->next_heap && b->next_heap->free) {
+    if (b->next_heap && block_is_free(b->next_heap)) {
         coalesce_count++;
         block_header *n = b->next_heap;
 
         remove_from_pool(n);
 
-        b->size += sizeof(block_header) + n->size;
+        block_set_size(b, block_size(b) + sizeof(block_header) + block_size(n));
         b->next_heap = n->next_heap;
 
         if (n->next_heap)
@@ -489,16 +546,14 @@ static block_header *coalesce(block_header *b) {
 static block_header *split_block(block_header *b, size_t need) {
     const size_t header_sz = sizeof(block_header);
     size_t total_after_split = need + header_sz + MIN_SPLIT_PAYLOAD;
-    if (b->size < total_after_split)
+    if (block_size(b) < total_after_split)
         return b;
 
     split_count++;
-    size_t rem_payload = b->size - need - header_sz;
+    size_t rem_payload = block_size(b) - need - header_sz;
 
     block_header *n = (block_header *)((unsigned char *)(b + 1) + need);
-    n->size = rem_payload;
-    n->magic = MAGIC;
-    n->free = 1;
+    block_init_header(n, rem_payload, 1);
     n->prev_heap = b;
     n->next_heap = b->next_heap;
     if (b->next_heap)
@@ -506,12 +561,9 @@ static block_header *split_block(block_header *b, size_t need) {
     else
         heap_tail = n;
     b->next_heap = n;
-    n->prev = n->next = NULL;
-    n->left = n->right = nil();
-    n->parent = NULL;
-    n->color = BLACK;
+    block_clear_pool_links(n);
 
-    b->size = need;
+    block_set_size(b, need);
     free_to_pool(n);
     return b;
 }
@@ -532,8 +584,8 @@ void *hpmalloc(size_t size) {
     if (need <= SIZE_THRESHOLD) {
         unsigned start = bucket_index_for_size(need);
         for (unsigned i = start; i < NUM_BUCKETS; i++) {
-            for (block_header *b = buckets[i]; b; b = b->next) {
-                if (b->size >= need) {
+            for (block_header *b = buckets[i]; b; b = BUCKET_NEXT(b)) {
+                if (block_size(b) >= need) {
                     bucket_remove(b, i);
                     blk = b;
                     break;
@@ -563,11 +615,8 @@ void *hpmalloc(size_t size) {
     pool_allocs++;
 
     blk = split_block(blk, need);
-    blk->free = 0;
-    blk->prev = blk->next = NULL;
-    blk->left = blk->right = nil();
-    blk->parent = NULL;
-    blk->color = BLACK;
+    block_set_free(blk, 0);
+    block_clear_pool_links(blk);
     return (void *)(blk + 1);
 }
 
@@ -582,14 +631,13 @@ void hpfree(void *ptr) {
 
     block_header *b = (block_header *)ptr - 1;
 
-    if (b->magic != MAGIC)
+    if (!block_magic_ok(b))
         return;
 
-    // prevent double free corruption
-    if (b->free)
+    if (block_is_free(b))
         return;
 
-    b->free = 1;
+    block_set_free(b, 1);
 
     b = coalesce(b);
 
@@ -617,13 +665,13 @@ void hp_get_stats(hp_stats_t *out) {
 
     for (block_header *b = heap_head; b; b = b->next_heap) {
         out->metadata_bytes += sizeof(block_header);
-        if (b->free) {
-            out->free_user_bytes += b->size;
-            if (b->size > out->largest_free_block)
-                out->largest_free_block = b->size;
+        if (block_is_free(b)) {
+            out->free_user_bytes += block_size(b);
+            if (block_size(b) > out->largest_free_block)
+                out->largest_free_block = block_size(b);
         } else {
             out->live_blocks++;
-            out->live_user_bytes += b->size;
+            out->live_user_bytes += block_size(b);
         }
     }
 }
