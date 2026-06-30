@@ -6,7 +6,7 @@
 #include "allocator.h"
 
 #define SLOTS 1000
-#define OPS 200
+#define OPS 10000
 
 typedef struct {
     void *ptr;

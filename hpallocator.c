@@ -69,8 +69,11 @@ static size_t split_count = 0;
 static size_t coalesce_count = 0;
 static size_t sbrk_calls = 0;
 static size_t bytes_requested_from_os = 0;
+static size_t peak_bytes_from_os = 0;
 static size_t malloc_calls = 0;
 static size_t free_calls = 0;
+static size_t pool_allocs = 0;
+static size_t os_allocs = 0;
 
 
 
@@ -395,6 +398,8 @@ static block_header *request_space(block_header *last, size_t user_size) {
 
     sbrk_calls++;
     bytes_requested_from_os += sizeof(block_header) + user_size;
+    if (bytes_requested_from_os > peak_bytes_from_os)
+        peak_bytes_from_os = bytes_requested_from_os;
 
     
     block->size = user_size;
@@ -551,8 +556,11 @@ void *hpmalloc(size_t size) {
         blk = request_space(heap_tail, need);
         if (!blk)
             return NULL;
+        os_allocs++;
         return (void *)(blk + 1);
     }
+
+    pool_allocs++;
 
     blk = split_block(blk, need);
     blk->free = 0;
@@ -586,4 +594,48 @@ void hpfree(void *ptr) {
     b = coalesce(b);
 
     free_to_pool(b);
+}
+
+void hp_get_stats(hp_stats_t *out) {
+    if (!out)
+        return;
+
+    out->malloc_calls = malloc_calls;
+    out->free_calls = free_calls;
+    out->split_count = split_count;
+    out->coalesce_count = coalesce_count;
+    out->sbrk_calls = sbrk_calls;
+    out->bytes_from_os = bytes_requested_from_os;
+    out->peak_bytes_from_os = peak_bytes_from_os;
+    out->pool_allocs = pool_allocs;
+    out->os_allocs = os_allocs;
+    out->metadata_bytes = 0;
+    out->live_user_bytes = 0;
+    out->free_user_bytes = 0;
+    out->largest_free_block = 0;
+    out->live_blocks = 0;
+
+    for (block_header *b = heap_head; b; b = b->next_heap) {
+        out->metadata_bytes += sizeof(block_header);
+        if (b->free) {
+            out->free_user_bytes += b->size;
+            if (b->size > out->largest_free_block)
+                out->largest_free_block = b->size;
+        } else {
+            out->live_blocks++;
+            out->live_user_bytes += b->size;
+        }
+    }
+}
+
+void hp_reset_stats(void) {
+    split_count = 0;
+    coalesce_count = 0;
+    sbrk_calls = 0;
+    bytes_requested_from_os = 0;
+    peak_bytes_from_os = 0;
+    malloc_calls = 0;
+    free_calls = 0;
+    pool_allocs = 0;
+    os_allocs = 0;
 }
